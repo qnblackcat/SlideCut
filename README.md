@@ -1,7 +1,7 @@
 # SlideCutPlus
 
 Touch the space key, slide to a letter and release to trigger an editing shortcut.
-A rewrite of SlideCut for iOS 15+.
+A rewrite of [SlideCut](https://github.com/r-plus/SlideCut) by r-plus for iOS 15+.
 
 ## Better support for Vietnamese Telex
 
