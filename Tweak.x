@@ -58,6 +58,7 @@
 - (void)selectWordBackward;
 - (void)scrollSelectionToVisible:(BOOL)animated;
 - (void)_define:(id)term;
+- (void)_translate:(id)sender;
 - (void)_moveLeft:(BOOL)extending withHistory:(id)history;
 - (void)_moveRight:(BOOL)extending withHistory:(id)history;
 - (void)_moveUp:(BOOL)extending withHistory:(id)history;
@@ -89,7 +90,7 @@ typedef NS_ENUM(NSInteger, SCPAction) {
     SCPActionMoveDown,
     SCPActionMoveUp,
     SCPActionMoveRight,
-    SCPActionDefine,
+    SCPActionTranslate,
     SCPActionPreviousWord,
     SCPActionNextWord,
     SCPActionDeleteWord,
@@ -449,18 +450,19 @@ static void SCPPerform(SCPAction action) {
         case SCPActionMoveDown:  SCPMoveCaret(delegate, UITextLayoutDirectionDown); break;
         case SCPActionMoveUp:    SCPMoveCaret(delegate, UITextLayoutDirectionUp); break;
         case SCPActionMoveRight: SCPMoveCaret(delegate, UITextLayoutDirectionRight); break;
-        case SCPActionDefine: {
-            if (![delegate respondsToSelector:@selector(_define:)]) break;
+        case SCPActionTranslate: {
+            // iOS 15+ has the system Translate action; iOS 14 falls back to Look Up.
+            BOOL canTranslate = [delegate respondsToSelector:@selector(_translate:)];
+            if (!canTranslate && ![delegate respondsToSelector:@selector(_define:)]) break;
             BOOL hadSelection = SCPSelectedText(delegate).length > 0;
             if (!SCPEnsureSelection(delegate)) break;
-            if (web && !hadSelection) {
-                // WebKit updates the selection asynchronously.
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [delegate _define:SCPSelectedText(delegate)];
-                });
-            } else {
-                [delegate _define:SCPSelectedText(delegate)];
-            }
+            void (^show)(void) = ^{
+                if (canTranslate) [delegate _translate:nil];
+                else [delegate _define:SCPSelectedText(delegate)];
+            };
+            // WebKit updates the selection asynchronously.
+            if (web && !hadSelection) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), show);
+            else show();
             break;
         }
         case SCPActionPreviousWord: SCPMoveByWord(delegate, NO); break;
@@ -589,7 +591,7 @@ static BOOL SCPShouldLoad(void) {
             @"j": @(SCPActionMoveDown),
             @"k": @(SCPActionMoveUp),
             @"l": @(SCPActionMoveRight),
-            @"d": @(SCPActionDefine),
+            @"d": @(SCPActionTranslate),
             @"n": @(SCPActionPreviousWord),
             @"m": @(SCPActionNextWord),
             @"delete": @(SCPActionDeleteWord),

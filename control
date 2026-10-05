@@ -1,6 +1,6 @@
 Package: com.qn.slidecutplus
 Name: SlideCutPlus
-Version: 1.0.1
+Version: 1.0.2
 Architecture: iphoneos-arm
 Description: Slide from the space key to a letter to trigger editing shortcuts (cut, copy, paste, undo, cursor movement...). Rewrite of SlideCut for iOS 15+.
 Maintainer: Qn
