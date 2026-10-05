@@ -3,11 +3,7 @@
 Touch the space key, slide to a letter and release to trigger an editing shortcut.
 A rewrite of [SlideCut](https://github.com/r-plus/SlideCut) by r-plus for iOS 15+.
 
-> **Note:** This is a fork of [r-plus/SlideCut](https://github.com/r-plus/SlideCut). The source code there
-> has not been updated since 0.3 (2014). The developer kept shipping closed-source builds (up to 0.9,
-> including a rootless build in 2023), but the source was never published.
-> SlideCutPlus continues from the open-source code with a full rewrite for iOS 15+ (new bundle id
-> `com.qn.slidecutplus`, conflicts with and replaces `jp.r-plus.slidecut`).
+> **Note:** The original source hasn't been updated since 2014 (later builds, incl. rootless in 2023, are closed-source). This fork rewrites it for iOS 15+.
 
 ## Better support for Vietnamese Telex
 
