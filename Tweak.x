@@ -1,391 +1,601 @@
+// SlideCutPlus — touch the space key, slide to a letter, release → editing shortcut.
+// Clean-room rewrite of SlideCut (r_plus) targeting iOS 15+.
+
+#import <UIKit/UIKit.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
-// interfaces {{{
-@interface UIResponder(SlideCut)
-- (void)scrollSelectionToVisible:(BOOL)scroll;
-- (void)_define:(NSString *)text;
-@end
+#pragma mark - Private interfaces
 
-@interface UIFieldEditor
-+ (id)sharedFieldEditor;
-- (void)revealSelection;
-@end
-
-@interface UITouch(SlideCut)
-@property(nonatomic, assign, getter=isStartedFromSpaceKeySC) BOOL startedFromSpaceKeySC;
-@end
-
-@interface UIKeyboardLayoutStar
-- (id)keyHitTest:(CGPoint)arg1;// UIKBTree
+@interface UIKBTree : NSObject
+- (NSString *)name;
 - (NSString *)unhashedName;
+- (NSString *)representedString;
+- (NSString *)displayString;
 - (NSString *)variantDisplayString;
+- (NSDictionary *)properties;
 @end
 
-@interface UIKeyboardImpl
-@property(readonly) UIResponder<UITextInput> * privateInputDelegate;
-@property(readonly) UIResponder<UITextInput> * inputDelegate;
-+ (id)sharedInstance;
+@interface UIKBTouchState : NSObject
++ (instancetype)touchStateForTouchUUID:(NSUUID *)uuid withTimestamp:(NSTimeInterval)timestamp phase:(UITouchPhase)phase location:(CGPoint)location pathIndex:(unsigned char)pathIndex inView:(UIView *)view;
+- (NSUUID *)touchUUID;
+- (NSUInteger)tapCount;
+- (NSTimeInterval)timestamp;
+- (NSUInteger)pathIndex;
+- (CGPoint)locationInView:(UIView *)view;
+@end
+
+@interface UIKeyboardTaskExecutionContext : NSObject
+@end
+
+@interface UIKeyboardLayoutStar : UIView
+- (UIKBTree *)keyHitTest:(CGPoint)point;
+- (void)touchCancelled:(UIKBTouchState *)touch executionContext:(UIKeyboardTaskExecutionContext *)context;
+@end
+
+@interface UIKBInputDelegateManager : NSObject
+- (void)insertText:(NSString *)text;
+@end
+
+@interface UIKeyboardImpl : UIView
++ (instancetype)sharedInstance;
++ (instancetype)activeInstance;
 - (id)delegateAsResponder;
+- (id)inputDelegate;
+- (UIKBInputDelegateManager *)inputDelegateManager;
 - (void)deleteBackward;
 - (void)insertText:(NSString *)text;
 @end
-// }}}
 
-static BOOL isSlideCutting = NO;
-static BOOL isDeleteCutting = NO;
-static NSArray *slideCutKeys;
-
-@implementation UITouch(SlideCut) // {{{
-static char SlideCutStartedFromSpaceKey;
-- (void)setStartedFromSpaceKeySC:(BOOL)isStartedFromSpaceKey
-{
-    [self willChangeValueForKey:@"SlideCutStartedFromSpaceKey"];
-    objc_setAssociatedObject(self, &SlideCutStartedFromSpaceKey,
-            [NSNumber numberWithBool:isStartedFromSpaceKey],
-            OBJC_ASSOCIATION_ASSIGN);
-    [self didChangeValueForKey:@"SlideCutStartedFromSpaceKey"];
-}
-
-- (BOOL)isStartedFromSpaceKeySC
-{
-    return [objc_getAssociatedObject(self, &SlideCutStartedFromSpaceKey) boolValue];
-}
+@interface UIFieldEditor : UIView
++ (instancetype)sharedFieldEditor;
+- (void)revealSelection;
 @end
-// }}}
-// Helper Functions {{{
-// Unfortunately, _UITextKitTextPosition subclass of UITextPosition instance will return instead of UITextPosition since iOS 7.
-// That is too buggy. Not return correct position.
-static UITextRange *LineEdgeTextRange(id<UITextInput> delegate, UITextLayoutDirection direction)
-{
-    id<UITextInputTokenizer> tokenizer = delegate.tokenizer;
-    UITextPosition *lineEdgePosition = [tokenizer positionFromPosition:delegate.selectedTextRange.end toBoundary:UITextGranularityLine inDirection:direction];
-    // for until iOS 6 component.
-    if ([lineEdgePosition isMemberOfClass:%c(UITextPositionImpl)])
-        return [delegate textRangeFromPosition:lineEdgePosition toPosition:lineEdgePosition];
-    // for iOS 7 buggy _UITextKitTextPosition workaround.
-    for (int i=1; i<1000; i++) {
-        lineEdgePosition = [delegate positionFromPosition:delegate.selectedTextRange.start inDirection:direction offset:i];
-        NSComparisonResult result = [delegate comparePosition:lineEdgePosition
-            toPosition:(direction == UITextLayoutDirectionLeft) ? delegate.beginningOfDocument : delegate.endOfDocument];
-        if (!lineEdgePosition || result == NSOrderedSame)
-            return [delegate textRangeFromPosition:lineEdgePosition toPosition:lineEdgePosition];
-        UITextRange *range = [delegate textRangeFromPosition:delegate.selectedTextRange.start toPosition:lineEdgePosition];
-        NSString *text = [delegate textInRange:range];
-        if ([text hasPrefix:@"\n"] || [text hasSuffix:@"\n"]) {
-            lineEdgePosition = [delegate positionFromPosition:delegate.selectedTextRange.start inDirection:direction offset:i-1];
-            return [delegate textRangeFromPosition:lineEdgePosition toPosition:lineEdgePosition];
-        }
+
+@interface UIResponder (SlideCutPlusPrivate)
+- (void)executeEditCommandWithCallback:(NSString *)command;  // WKContentView
+- (NSString *)selectedText;                                   // WKContentView
+- (void)selectWordBackward;
+- (void)scrollSelectionToVisible:(BOOL)animated;
+- (void)_define:(id)term;
+- (void)_moveLeft:(BOOL)extending withHistory:(id)history;
+- (void)_moveRight:(BOOL)extending withHistory:(id)history;
+- (void)_moveUp:(BOOL)extending withHistory:(id)history;
+- (void)_moveDown:(BOOL)extending withHistory:(id)history;
+- (void)_moveToStartOfLine:(BOOL)extending withHistory:(id)history;
+- (void)_moveToEndOfLine:(BOOL)extending withHistory:(id)history;
+- (void)_moveToStartOfWord:(BOOL)extending withHistory:(id)history;
+- (void)_moveToEndOfWord:(BOOL)extending withHistory:(id)history;
+- (void)_moveToStartOfDocument:(BOOL)extending withHistory:(id)history;
+- (void)_moveToEndOfDocument:(BOOL)extending withHistory:(id)history;
+@end
+
+#pragma mark - State
+
+typedef NS_ENUM(NSInteger, SCPAction) {
+    SCPActionNone = 0,
+    SCPActionCut,
+    SCPActionCopy,
+    SCPActionPaste,
+    SCPActionSelectAll,
+    SCPActionUndo,
+    SCPActionRedo,
+    SCPActionLineStart,
+    SCPActionLineEnd,
+    SCPActionDocumentStart,
+    SCPActionDocumentEnd,
+    SCPActionSelectWord,
+    SCPActionMoveLeft,
+    SCPActionMoveDown,
+    SCPActionMoveUp,
+    SCPActionMoveRight,
+    SCPActionDefine,
+    SCPActionPreviousWord,
+    SCPActionNextWord,
+    SCPActionDeleteWord,
+};
+
+static NSDictionary<NSString *, NSNumber *> *SCPKeyMap;
+
+// touchUUIDs of keyboard touches that went down on the space key.
+static NSMutableSet<NSUUID *> *gSpaceTouches;
+
+#pragma mark - Key helpers
+
+static BOOL SCPIsSpaceKey(UIKBTree *key) {
+    if (!key) return NO;
+    NSString *name = [key respondsToSelector:@selector(unhashedName)] ? [key unhashedName] : [key name];
+    if ([name isEqualToString:@"Space-Key"] || [name isEqualToString:@"Unlabeled-Space-Key"]) return YES;
+    return [key respondsToSelector:@selector(representedString)] && [[key representedString] isEqualToString:@" "];
+}
+
+static SCPAction SCPActionForKey(UIKBTree *key) {
+    if (!key || SCPIsSpaceKey(key)) return SCPActionNone;
+
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    if ([key respondsToSelector:@selector(representedString)] && [key representedString]) [candidates addObject:[key representedString]];
+    if ([key respondsToSelector:@selector(variantDisplayString)] && [key variantDisplayString]) [candidates addObject:[key variantDisplayString]];
+    if ([key respondsToSelector:@selector(displayString)] && [key displayString]) [candidates addObject:[key displayString]];
+    if ([key respondsToSelector:@selector(properties)]) {
+        id represented = [key properties][@"KBrepresentedString"];
+        if ([represented isKindOfClass:[NSString class]]) [candidates addObject:represented];
     }
-    return nil;
-}
 
-static UITextRange *WordSelectedTextRange(id<UITextInput> delegate, UITextStorageDirection direction)
-{
-    UITextRange *range = [delegate.tokenizer rangeEnclosingPosition:delegate.selectedTextRange.start
-        withGranularity:UITextGranularityWord
-        inDirection:direction];
-    if (!range) {
-        if (direction == UITextStorageDirectionBackward) {
-            UITextPosition *p = [delegate.tokenizer positionFromPosition:delegate.selectedTextRange.start toBoundary:UITextGranularityWord inDirection:UITextStorageDirectionBackward];
-            if (!p)
-                p = [delegate.tokenizer positionFromPosition:delegate.selectedTextRange.start toBoundary:UITextGranularityLine inDirection:UITextLayoutDirectionUp];
-            range = [delegate.tokenizer rangeEnclosingPosition:p withGranularity:UITextGranularityWord inDirection:UITextStorageDirectionBackward];
-        } else {
-            UITextPosition *p = [delegate.tokenizer positionFromPosition:delegate.selectedTextRange.start toBoundary:UITextGranularityWord inDirection:UITextStorageDirectionForward];
-            if (!p)
-                p = [delegate.tokenizer positionFromPosition:delegate.selectedTextRange.end toBoundary:UITextGranularityLine inDirection:UITextLayoutDirectionDown];
-            range = [delegate.tokenizer rangeEnclosingPosition:p withGranularity:UITextGranularityWord inDirection:UITextStorageDirectionForward];
-        }
+    for (NSString *candidate in candidates) {
+        NSNumber *action = SCPKeyMap[candidate.lowercaseString];
+        if (action) return (SCPAction)action.integerValue;
     }
-    return range;
+    return SCPActionNone;
 }
 
-static UITextRange *AutoDirectionWordSelectedTextRange(id<UITextInput> delegate)
-{
-    BOOL hasRightText = [delegate.tokenizer isPosition:delegate.selectedTextRange.start withinTextUnit:UITextGranularityWord inDirection:UITextLayoutDirectionRight];
-    UITextStorageDirection direction = hasRightText ? UITextStorageDirectionForward : UITextStorageDirectionBackward;
-    return WordSelectedTextRange(delegate, direction);
-}
+#pragma mark - Text helpers
 
-static UITextRange *WordMovedTextRange(id<UITextInput> delegate, UITextStorageDirection direction)
-{
-    UITextRange *range = WordSelectedTextRange(delegate, direction);
-    if (direction == UITextStorageDirectionForward)
-        return [delegate textRangeFromPosition:range.end toPosition:range.end];
-    else
-        return [delegate textRangeFromPosition:range.start toPosition:range.start];
-}
-
-static void RevealSelection(id<UITextInput> delegate)
-{
-    // reveal for UITextField.
-    [[%c(UIFieldEditor) sharedFieldEditor] revealSelection];
-    // reveal for UITextView, UITextContentView and UIWebDocumentView.
-    if ([delegate respondsToSelector:@selector(scrollSelectionToVisible:)])
-        [(UIResponder *)delegate scrollSelectionToVisible:YES];
-}
-
-static void ShiftCaretToOneCharacter(id<UITextInput> delegate, UITextLayoutDirection direction)
-{
-    UITextPosition *position = [delegate positionFromPosition:delegate.selectedTextRange.start inDirection:direction offset:1];
-    if (!position)
-        return;
-    UITextRange *range = [delegate textRangeFromPosition:position toPosition:position];
-    delegate.selectedTextRange = range;
-    RevealSelection(delegate);
-}
-// }}}
-static BOOL SlideCutFunction(NSString *text)// {{{
-{
-    // return YES if function is fire.
-    NSString *lowercaseText = [text lowercaseString];
-    NSUInteger functionIndex = [slideCutKeys indexOfObject:lowercaseText];
-    if (functionIndex == NSNotFound)
-        return NO;
-
-    UIKeyboardImpl *keyboardImpl = [%c(UIKeyboardImpl) sharedInstance];
-    UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    UIResponder<UITextInput> *delegate = [keyboardImpl delegateAsResponder];
-/*    self.privateInputDelegate ?: self.inputDelegate;*/
-    NSString *selectedString = [delegate textInRange:delegate.selectedTextRange];
-
-    CMLog(@"delegate = %@", delegate);
-    CMLog(@"selectedString = %@", selectedString);
-
-    switch (functionIndex) {
-        case 0:
-        case 1:
-            // X: Cut
-            // C: Copy
-            if (!selectedString.length) {
-                UITextRange *textRange = AutoDirectionWordSelectedTextRange(delegate);
-                if (!textRange)
-                    break;
-                delegate.selectedTextRange = textRange;
-                selectedString = [delegate textInRange:textRange];
-            }
-            pb.string = selectedString;
-            if (functionIndex == 0)
-                [keyboardImpl deleteBackward];
-            break;
-        case 2:
-            // V: Paste
-            if (pb.string.length)
-                [keyboardImpl insertText:pb.string];
-            break;
-        case 3:
-            // A: Select all
-            if ([delegate respondsToSelector:@selector(selectAll:)])
-                [delegate selectAll:nil];
-            else if ([delegate respondsToSelector:@selector(selectAll)])
-                [delegate performSelector:@selector(selectAll)];
-            break;
-        case 4:
-            // Z: Undo
-            if ([delegate respondsToSelector:@selector(undoManager)] && [delegate.undoManager canUndo])
-                [delegate.undoManager undo];
-            break;
-        case 5:
-            // Y: Redo
-            if ([delegate respondsToSelector:@selector(undoManager)] && [delegate.undoManager canRedo])
-                [delegate.undoManager redo];
-            break;
-        case 6:
-            // Q: Start line
-            delegate.selectedTextRange = LineEdgeTextRange(delegate, UITextLayoutDirectionLeft);
-            RevealSelection(delegate);
-            break;
-        case 7:
-            // P: End line
-            delegate.selectedTextRange = LineEdgeTextRange(delegate, UITextLayoutDirectionRight);
-            RevealSelection(delegate);
-            break;
-        case 8:
-            // B: Beginning of Document
-            delegate.selectedTextRange = [delegate textRangeFromPosition:delegate.beginningOfDocument toPosition:delegate.beginningOfDocument];
-            RevealSelection(delegate);
-            break;
-        case 9:
-            // E: End of Document
-            delegate.selectedTextRange = [delegate textRangeFromPosition:delegate.endOfDocument toPosition:delegate.endOfDocument];
-            RevealSelection(delegate);
-            break;
-        case 10:
-            // S: Select word
-            if (!selectedString.length) {
-                UITextRange *textRange = AutoDirectionWordSelectedTextRange(delegate);
-                if (!textRange)
-                    break;
-                delegate.selectedTextRange = textRange;
-            }
-            break;
-        case 11:
-            // J: Caret move to down(Vim style)
-            ShiftCaretToOneCharacter(delegate, UITextLayoutDirectionDown);
-            break;
-        case 12:
-            // K: Caret move to up(Vim style)
-            ShiftCaretToOneCharacter(delegate, UITextLayoutDirectionUp);
-            break;
-        case 13:
-            // H: Caret move to left(Vim style)
-            ShiftCaretToOneCharacter(delegate, UITextLayoutDirectionLeft);
-            break;
-        case 14:
-            // L: Caret move to right(Vim style)
-            ShiftCaretToOneCharacter(delegate, UITextLayoutDirectionRight);
-            break;
-        case 15:
-            // D: Define
-            if (!selectedString.length) {
-                UITextRange *textRange = AutoDirectionWordSelectedTextRange(delegate);
-                if (!textRange)
-                    break;
-                delegate.selectedTextRange = textRange;
-                selectedString = [delegate textInRange:textRange];
-            }
-            if ([delegate respondsToSelector:@selector(_define:)])
-                [delegate _define:selectedString];
-            break;
-        case 16:
-            // delete: Delete backward word
-            if (!selectedString.length) {
-                UITextRange *textRange = WordSelectedTextRange(delegate, UITextStorageDirectionBackward);
-                if (!textRange)
-                    break;
-                delegate.selectedTextRange = textRange;
-            }
-            isDeleteCutting = YES;
-            [keyboardImpl deleteBackward];
-            break;
-        case 17:
-            // N: Previous word position.
-            if (!selectedString.length) {
-                UITextRange *textRange = WordMovedTextRange(delegate, UITextStorageDirectionBackward);
-                if (!textRange)
-                    break;
-                delegate.selectedTextRange = textRange;
-                RevealSelection(delegate);
-            }
-            break;
-        case 18:
-            // M: Next word position.
-            if (!selectedString.length) {
-                UITextRange *textRange = WordMovedTextRange(delegate, UITextStorageDirectionForward);
-                if (!textRange)
-                    break;
-                delegate.selectedTextRange = textRange;
-                RevealSelection(delegate);
-            }
-            break;
-        default:
-            return NO;
+static UIKeyboardImpl *SCPKeyboardImpl(void) {
+    Class cls = objc_getClass("UIKeyboardImpl");
+    if ([cls respondsToSelector:@selector(activeInstance)]) {
+        UIKeyboardImpl *impl = [cls activeInstance];
+        if (impl) return impl;
     }
+    return [cls sharedInstance];
+}
+
+static id SCPDelegate(UIKeyboardImpl *impl) {
+    id delegate = nil;
+    if ([impl respondsToSelector:@selector(delegateAsResponder)]) delegate = [impl delegateAsResponder];
+    if (!delegate && [impl respondsToSelector:@selector(inputDelegate)]) delegate = [impl inputDelegate];
+    return delegate;
+}
+
+static BOOL SCPIsWebView(id delegate) {
+    static Class wkContentView;
+    if (!wkContentView) wkContentView = objc_getClass("WKContentView");
+    return wkContentView && [delegate isKindOfClass:wkContentView];
+}
+
+static BOOL SCPWebCommand(id delegate, NSString *command) {
+    if (![delegate respondsToSelector:@selector(executeEditCommandWithCallback:)]) return NO;
+    [delegate executeEditCommandWithCallback:command];
     return YES;
 }
-// }}}
-// injection hook {{{
-%hook UIKeyboardLayoutStar
-- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
-{
-    %orig;
-    isSlideCutting = NO;
-    isDeleteCutting = NO;
-    for (UITouch *touch in [touches allObjects]) {
-        id kbTree = [self keyHitTest:[touch locationInView:touch.view]];
-        if ([kbTree respondsToSelector:@selector(unhashedName)]) {
-            NSString *unhashedName = [kbTree unhashedName];
-            if (([unhashedName isEqualToString:@"Space-Key"] || [unhashedName isEqualToString:@"Unlabeled-Space-Key"]) && touch.tapCount >= 1) {
-                touch.startedFromSpaceKeySC = YES;
+
+// WebCore editing command, falling back to the private UITextInput `_move…:withHistory:` method.
+static void SCPWebMove(id delegate, NSString *command, SEL fallback) {
+    if (SCPWebCommand(delegate, command)) return;
+    if ([delegate respondsToSelector:fallback]) ((void (*)(id, SEL, BOOL, id))objc_msgSend)(delegate, fallback, NO, nil);
+}
+
+// Letters (including Vietnamese with combining marks), digits and underscore.
+static NSCharacterSet *SCPWordCharacters(void) {
+    static NSCharacterSet *set;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *characters = [NSMutableCharacterSet alphanumericCharacterSet];
+        [characters formUnionWithCharacterSet:[NSCharacterSet nonBaseCharacterSet]];
+        [characters addCharactersInString:@"_"];
+        set = [characters copy];
+    });
+    return set;
+}
+
+static BOOL SCPIsTextInput(id delegate) {
+    return [delegate conformsToProtocol:@protocol(UITextInput)] && [delegate respondsToSelector:@selector(selectedTextRange)];
+}
+
+static NSString *SCPSelectedText(id delegate) {
+    NSString *text = nil;
+    if (SCPIsTextInput(delegate)) {
+        UITextRange *range = [delegate selectedTextRange];
+        if (range && !range.isEmpty) text = [delegate textInRange:range];
+    }
+    if (!text.length && SCPIsWebView(delegate) && [delegate respondsToSelector:@selector(selectedText)]) {
+        text = [delegate selectedText];
+    }
+    return text;
+}
+
+static void SCPReveal(id<UITextInput> delegate) {
+    Class fieldEditorClass = objc_getClass("UIFieldEditor");
+    if ([fieldEditorClass respondsToSelector:@selector(sharedFieldEditor)]) {
+        UIFieldEditor *editor = [fieldEditorClass sharedFieldEditor];
+        if ([editor respondsToSelector:@selector(revealSelection)]) [editor revealSelection];
+        else if ([editor respondsToSelector:@selector(scrollSelectionToVisible:)]) [editor scrollSelectionToVisible:YES];
+    }
+    if ([(id)delegate respondsToSelector:@selector(scrollSelectionToVisible:)]) {
+        [(id)delegate scrollSelectionToVisible:YES];
+    } else if ([(id)delegate isKindOfClass:[UITextView class]]) {
+        UITextView *textView = (UITextView *)delegate;
+        [textView scrollRangeToVisible:textView.selectedRange];
+    }
+}
+
+static void SCPSetCaret(id<UITextInput> delegate, UITextPosition *position) {
+    if (!position) return;
+    UITextRange *range = [delegate textRangeFromPosition:position toPosition:position];
+    if (!range) return;
+    delegate.selectedTextRange = range;
+    SCPReveal(delegate);
+}
+
+// Range of the word enclosing the caret, falling back to the nearest word
+// in `direction` (UITextStorageDirectionForward / Backward).
+static UITextRange *SCPWordRange(id<UITextInput> delegate, UITextStorageDirection direction) {
+    id<UITextInputTokenizer> tokenizer = delegate.tokenizer;
+    UITextRange *selection = delegate.selectedTextRange;
+    if (!tokenizer || !selection) return nil;
+
+    UITextRange *range = [tokenizer rangeEnclosingPosition:selection.start withGranularity:UITextGranularityWord inDirection:(UITextDirection)direction];
+    if (range) return range;
+
+    UITextPosition *position;
+    if (direction == UITextStorageDirectionBackward) {
+        position = [tokenizer positionFromPosition:selection.start toBoundary:UITextGranularityWord inDirection:(UITextDirection)UITextStorageDirectionBackward];
+        if (!position) position = [tokenizer positionFromPosition:selection.start toBoundary:UITextGranularityLine inDirection:(UITextDirection)UITextLayoutDirectionUp];
+    } else {
+        position = [tokenizer positionFromPosition:selection.start toBoundary:UITextGranularityWord inDirection:(UITextDirection)UITextStorageDirectionForward];
+        if (!position) position = [tokenizer positionFromPosition:selection.end toBoundary:UITextGranularityLine inDirection:(UITextDirection)UITextLayoutDirectionDown];
+    }
+    if (!position) return nil;
+    return [tokenizer rangeEnclosingPosition:position withGranularity:UITextGranularityWord inDirection:(UITextDirection)direction];
+}
+
+static UITextRange *SCPWordRangeAtCaret(id<UITextInput> delegate) {
+    UITextRange *selection = delegate.selectedTextRange;
+    if (!selection) return nil;
+    BOOL insideWord = [delegate.tokenizer isPosition:selection.start withinTextUnit:UITextGranularityWord inDirection:(UITextDirection)UITextLayoutDirectionRight];
+    return SCPWordRange(delegate, insideWord ? UITextStorageDirectionForward : UITextStorageDirectionBackward);
+}
+
+// Select the word at the caret when nothing is selected. Returns whether a selection exists afterwards.
+static BOOL SCPEnsureSelection(id delegate) {
+    if (SCPSelectedText(delegate).length) return YES;
+    if (SCPIsWebView(delegate)) return SCPWebCommand(delegate, @"selectWord");
+    if (!SCPIsTextInput(delegate)) return NO;
+    UITextRange *range = SCPWordRangeAtCaret(delegate);
+    if (!range || range.isEmpty) return NO;
+    [delegate setSelectedTextRange:range];
+    return YES;
+}
+
+// From the caret back to the start of the previous word (skipping trailing whitespace).
+static UITextRange *SCPDeleteWordRange(id<UITextInput> delegate) {
+    UITextRange *selection = delegate.selectedTextRange;
+    id<UITextInputTokenizer> tokenizer = delegate.tokenizer;
+    if (!selection || !tokenizer) return nil;
+
+    UITextPosition *caret = selection.start;
+    UITextPosition *position = caret;
+    NSCharacterSet *whitespace = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    for (int i = 0; i < 3; i++) {
+        UITextPosition *previous = [tokenizer positionFromPosition:position toBoundary:UITextGranularityWord inDirection:(UITextDirection)UITextStorageDirectionBackward];
+        if (!previous || [delegate comparePosition:previous toPosition:position] != NSOrderedAscending) break;
+        position = previous;
+        NSString *text = [delegate textInRange:[delegate textRangeFromPosition:position toPosition:caret]];
+        if ([text stringByTrimmingCharactersInSet:whitespace].length) break;
+    }
+    if ([delegate comparePosition:position toPosition:caret] == NSOrderedSame) {
+        position = [delegate positionFromPosition:caret offset:-1];
+        if (!position) return nil;
+    }
+    return [delegate textRangeFromPosition:position toPosition:caret];
+}
+
+static void SCPDeleteBackward(UIKeyboardImpl *impl, id delegate) {
+    if ([impl respondsToSelector:@selector(deleteBackward)]) [impl deleteBackward];
+    else if ([delegate respondsToSelector:@selector(deleteBackward)]) [delegate deleteBackward];
+}
+
+// Insert through the keyboard so it (and kbd's input context) stays in sync with the document.
+static void SCPInsertText(UIKeyboardImpl *impl, id delegate, NSString *text) {
+    if (!text.length) return;
+    UIKBInputDelegateManager *manager = [impl respondsToSelector:@selector(inputDelegateManager)] ? [impl inputDelegateManager] : nil;
+    if ([manager respondsToSelector:@selector(insertText:)]) [manager insertText:text];
+    else if ([impl respondsToSelector:@selector(insertText:)]) [impl insertText:text];
+    else if ([delegate respondsToSelector:@selector(insertText:)]) [delegate insertText:text];
+}
+
+static BOOL SCPCanPerform(id delegate, SEL action) {
+    if (![delegate respondsToSelector:action]) return NO;
+    return SCPIsWebView(delegate) || [delegate canPerformAction:action withSender:nil];
+}
+
+static void SCPMoveCaret(id delegate, UITextLayoutDirection direction) {
+    if (SCPIsWebView(delegate)) {
+        switch (direction) {
+            case UITextLayoutDirectionRight: SCPWebMove(delegate, @"moveRight", @selector(_moveRight:withHistory:)); break;
+            case UITextLayoutDirectionLeft:  SCPWebMove(delegate, @"moveLeft", @selector(_moveLeft:withHistory:)); break;
+            case UITextLayoutDirectionUp:    SCPWebMove(delegate, @"moveUp", @selector(_moveUp:withHistory:)); break;
+            case UITextLayoutDirectionDown:  SCPWebMove(delegate, @"moveDown", @selector(_moveDown:withHistory:)); break;
+        }
+        return;
+    }
+    if (!SCPIsTextInput(delegate)) return;
+    UITextRange *selection = [delegate selectedTextRange];
+    BOOL forward = direction == UITextLayoutDirectionRight || direction == UITextLayoutDirectionDown;
+    // With a selection, left/right collapse it to the matching edge (standard behaviour).
+    if (!selection.isEmpty && (direction == UITextLayoutDirectionLeft || direction == UITextLayoutDirectionRight)) {
+        SCPSetCaret(delegate, forward ? selection.end : selection.start);
+        return;
+    }
+    UITextPosition *origin = forward ? selection.end : selection.start;
+    SCPSetCaret(delegate, [delegate positionFromPosition:origin inDirection:direction offset:1]);
+}
+
+static void SCPMoveToLineBoundary(id delegate, BOOL toEnd) {
+    if (SCPIsWebView(delegate)) {
+        if (toEnd) SCPWebMove(delegate, @"moveToEndOfLine", @selector(_moveToEndOfLine:withHistory:));
+        else SCPWebMove(delegate, @"moveToBeginningOfLine", @selector(_moveToStartOfLine:withHistory:));
+        return;
+    }
+    if (!SCPIsTextInput(delegate)) return;
+    UITextRange *selection = [delegate selectedTextRange];
+    UITextLayoutDirection direction = toEnd ? UITextLayoutDirectionRight : UITextLayoutDirectionLeft;
+    UITextPosition *origin = toEnd ? selection.end : selection.start;
+    SCPSetCaret(delegate, [[delegate tokenizer] positionFromPosition:origin toBoundary:UITextGranularityLine inDirection:(UITextDirection)direction]);
+}
+
+static void SCPMoveToDocumentBoundary(id delegate, BOOL toEnd) {
+    if (SCPIsWebView(delegate)) {
+        if (toEnd) SCPWebMove(delegate, @"moveToEndOfDocument", @selector(_moveToEndOfDocument:withHistory:));
+        else SCPWebMove(delegate, @"moveToBeginningOfDocument", @selector(_moveToStartOfDocument:withHistory:));
+        return;
+    }
+    if (!SCPIsTextInput(delegate)) return;
+    SCPSetCaret(delegate, toEnd ? [delegate endOfDocument] : [delegate beginningOfDocument]);
+}
+
+static void SCPMoveByWord(id delegate, BOOL forward) {
+    if (SCPIsWebView(delegate)) {
+        if (forward) SCPWebMove(delegate, @"moveWordForward", @selector(_moveToEndOfWord:withHistory:));
+        else SCPWebMove(delegate, @"moveWordBackward", @selector(_moveToStartOfWord:withHistory:));
+        return;
+    }
+    if (!SCPIsTextInput(delegate)) return;
+
+    if (forward) {
+        UITextRange *word = SCPWordRange(delegate, UITextStorageDirectionForward);
+        if (word) SCPSetCaret(delegate, word.end);
+        return;
+    }
+
+    // Backward lands right after the previous word's last letter ("abc def xyz|" -> "abc def| xyz"),
+    // not at the start of the current word, so a new word can be typed without Telex
+    // attaching to the word on the right.
+    static const NSInteger kWindow = 4096;
+    UITextRange *selection = [delegate selectedTextRange];
+    if (!selection) return;
+    UITextPosition *caret = selection.start;
+    NSInteger length = MIN([delegate offsetFromPosition:[delegate beginningOfDocument] toPosition:caret], kWindow);
+    if (length <= 0) return;
+
+    UITextRange *windowRange = [delegate textRangeFromPosition:[delegate positionFromPosition:caret offset:-length] toPosition:caret];
+    NSString *text = windowRange ? [delegate textInRange:windowRange] : nil;
+    if (!text.length) return;
+
+    NSCharacterSet *wordCharacters = SCPWordCharacters();
+
+    // Skip the word the caret is in (if any), then the whitespace/punctuation before it.
+    NSInteger index = (NSInteger)text.length;
+    while (index > 0 && [wordCharacters characterIsMember:[text characterAtIndex:index - 1]]) index--;
+    while (index > 0 && ![wordCharacters characterIsMember:[text characterAtIndex:index - 1]]) index--;
+    SCPSetCaret(delegate, [delegate positionFromPosition:caret offset:index - (NSInteger)text.length]);
+}
+
+#pragma mark - Actions
+
+static void SCPPerform(SCPAction action) {
+    UIKeyboardImpl *impl = SCPKeyboardImpl();
+    id delegate = SCPDelegate(impl);
+    if (!delegate) return;
+    BOOL web = SCPIsWebView(delegate);
+
+    switch (action) {
+        case SCPActionCut:
+        case SCPActionCopy: {
+            BOOL cut = action == SCPActionCut;
+            if (!SCPEnsureSelection(delegate)) break;
+            SEL sel = cut ? @selector(cut:) : @selector(copy:);
+            if (SCPCanPerform(delegate, sel)) {
+                ((void (*)(id, SEL, id))objc_msgSend)(delegate, sel, nil);
             } else {
-                touch.startedFromSpaceKeySC = NO;
+                NSString *text = SCPSelectedText(delegate);
+                if (!text.length) break;
+                [UIPasteboard generalPasteboard].string = text;
+                if (cut) SCPDeleteBackward(impl, delegate);
             }
+            break;
         }
+        case SCPActionPaste: {
+            UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
+            // Text is inserted as plain text through the keyboard, followed by a space so the
+            // next word can be typed straight away. paste: is avoided for text because on
+            // iOS 16+ it can finish asynchronously, which would put the space before the paste.
+            NSString *text = pasteboard.hasStrings ? pasteboard.string : nil;
+            if (text.length) {
+                unichar last = [text characterAtIndex:text.length - 1];
+                if (![[NSCharacterSet whitespaceAndNewlineCharacterSet] characterIsMember:last]) text = [text stringByAppendingString:@" "];
+                SCPInsertText(impl, delegate, text);
+            } else if (pasteboard.hasImages && SCPCanPerform(delegate, @selector(paste:))) {
+                [delegate paste:nil];
+            }
+            break;
+        }
+        case SCPActionSelectAll:
+            if ([delegate respondsToSelector:@selector(selectAll:)]) [delegate selectAll:nil];
+            else if (web) SCPWebCommand(delegate, @"selectAll");
+            break;
+        case SCPActionUndo:
+        case SCPActionRedo: {
+            BOOL undo = action == SCPActionUndo;
+            NSUndoManager *manager = [delegate respondsToSelector:@selector(undoManager)] ? [delegate undoManager] : nil;
+            if (manager && (undo ? manager.canUndo : manager.canRedo)) {
+                if (undo) [manager undo]; else [manager redo];
+            } else if (web) {
+                SCPWebCommand(delegate, undo ? @"undo" : @"redo");
+            }
+            break;
+        }
+        case SCPActionLineStart:     SCPMoveToLineBoundary(delegate, NO); break;
+        case SCPActionLineEnd:       SCPMoveToLineBoundary(delegate, YES); break;
+        case SCPActionDocumentStart: SCPMoveToDocumentBoundary(delegate, NO); break;
+        case SCPActionDocumentEnd:   SCPMoveToDocumentBoundary(delegate, YES); break;
+        case SCPActionSelectWord:
+            if (web) {
+                if (!SCPWebCommand(delegate, @"selectWord") && [delegate respondsToSelector:@selector(selectWordBackward)]) [delegate selectWordBackward];
+            } else {
+                SCPEnsureSelection(delegate);
+            }
+            break;
+        case SCPActionMoveLeft:  SCPMoveCaret(delegate, UITextLayoutDirectionLeft); break;
+        case SCPActionMoveDown:  SCPMoveCaret(delegate, UITextLayoutDirectionDown); break;
+        case SCPActionMoveUp:    SCPMoveCaret(delegate, UITextLayoutDirectionUp); break;
+        case SCPActionMoveRight: SCPMoveCaret(delegate, UITextLayoutDirectionRight); break;
+        case SCPActionDefine: {
+            if (![delegate respondsToSelector:@selector(_define:)]) break;
+            BOOL hadSelection = SCPSelectedText(delegate).length > 0;
+            if (!SCPEnsureSelection(delegate)) break;
+            if (web && !hadSelection) {
+                // WebKit updates the selection asynchronously.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [delegate _define:SCPSelectedText(delegate)];
+                });
+            } else {
+                [delegate _define:SCPSelectedText(delegate)];
+            }
+            break;
+        }
+        case SCPActionPreviousWord: SCPMoveByWord(delegate, NO); break;
+        case SCPActionNextWord:     SCPMoveByWord(delegate, YES); break;
+        case SCPActionDeleteWord:
+            if (web) {
+                if (SCPWebCommand(delegate, @"deleteWordBackward")) break;
+                if ([delegate respondsToSelector:@selector(selectWordBackward)]) [delegate selectWordBackward];
+                SCPDeleteBackward(impl, delegate);
+                break;
+            }
+            if (SCPIsTextInput(delegate) && ![delegate selectedTextRange].isEmpty) {
+                SCPDeleteBackward(impl, delegate);
+                break;
+            }
+            if (SCPIsTextInput(delegate)) {
+                UITextRange *range = SCPDeleteWordRange(delegate);
+                if (!range) break;
+                [delegate setSelectedTextRange:range];
+                SCPDeleteBackward(impl, delegate);
+            }
+            break;
+        case SCPActionNone:
+            break;
     }
-
-    /*
-    // belows return Space-Key
-    NSLog(@"%@", [kbTree unhashedName]);
-    NSLog(@"%@", [kbTree layoutName]);
-    NSLog(@"%@", [kbTree componentName]);
-
-    // below return UI-Space
-    NSLog(@"%@", [kbTree localizationKey]);
-    */
 }
-- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event
-{
-    NSString *hitedString = nil;
-    for (UITouch *touch in [touches allObjects]) {
-        id kbTree = [self keyHitTest:[touch locationInView:touch.view]];
-        if (touch.isStartedFromSpaceKeySC) {
-            NSString *lowercaseText = [[kbTree variantDisplayString] lowercaseString];
-            NSString *KBrepresentedString = [[[kbTree properties] objectForKey:@"KBrepresentedString"] lowercaseString];
-            for (NSString *string in [[NSString stringWithFormat:@"%@;%@", lowercaseText, KBrepresentedString] componentsSeparatedByString:@";"]) {
-                if (!string)
-                    continue;
-                NSUInteger functionIndex = [slideCutKeys indexOfObject:string];
-                if (functionIndex != NSNotFound) {
-                    hitedString = string;
-                    isSlideCutting = YES;
-                    break;
-                }
-            }
-        }
+
+#pragma mark - Hooks
+
+%hook UIKeyboardLayoutStar
+
+// iOS 13+ turns UITouches into UIKBTouchState and runs them on the keyboard task queue.
+// touchUp:executionContext: is where the released key is sent to the input manager (kbd),
+// so this is the only place where the letter can be reliably kept from being typed —
+// cancelling at the UITouch level is too late (the touch's phase is already Ended).
+
+- (void)touchDown:(UIKBTouchState *)touch executionContext:(UIKeyboardTaskExecutionContext *)context {
+    NSUUID *uuid = [touch touchUUID];
+    if (uuid) {
+        if (touch.tapCount > 0 && SCPIsSpaceKey([self keyHitTest:[touch locationInView:self]])) [gSpaceTouches addObject:uuid];
+        else [gSpaceTouches removeObject:uuid];
     }
-    if ([hitedString isEqualToString:@"delete"]) {
-        SlideCutFunction(hitedString);
-        return %orig;
-    }
-    if (!isSlideCutting || UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPhone)
-        return %orig;
-    SlideCutFunction(hitedString);
     %orig;
 }
-%end
-// }}}
-// feature hook {{{
-%hook UIKeyboardImpl
-%group iPhone
-- (void)insertText:(NSString *)text
-{
-    if (text.length == 1 && isSlideCutting && isDeleteCutting) {
-        isSlideCutting = NO;
-        isDeleteCutting = NO;
-        return;
-    }
-    if (!text || text.length != 1 || !isSlideCutting || [text isEqualToString:@" "])
-        return %orig;
 
-    isSlideCutting = NO;
-    if (!SlideCutFunction(text))
+- (void)touchUp:(UIKBTouchState *)touch executionContext:(UIKeyboardTaskExecutionContext *)context {
+    NSUUID *uuid = [touch touchUUID];
+    if (!uuid || ![gSpaceTouches containsObject:uuid]) {
         %orig;
-}
-%end
-%group iPad
-- (void)insertText:(NSString *)text
-{
-    if ([text isEqualToString:@" "] && isSlideCutting) {
-        isSlideCutting = NO;
         return;
     }
+    [gSpaceTouches removeObject:uuid];
+
+    SCPAction action = SCPActionForKey([self keyHitTest:[touch locationInView:self]]);
+    if (action == SCPActionNone) {
+        %orig;
+        return;
+    }
+
+    // Turn the touch-up into a cancel: the keyboard cleans up the touch (highlight, popups)
+    // and returns the execution context, but nothing reaches the input manager.
+    Class touchStateClass = objc_getClass("UIKBTouchState");
+    UIKBTouchState *cancelled = nil;
+    if ([touchStateClass respondsToSelector:@selector(touchStateForTouchUUID:withTimestamp:phase:location:pathIndex:inView:)]) {
+        cancelled = [touchStateClass touchStateForTouchUUID:uuid withTimestamp:touch.timestamp phase:UITouchPhaseCancelled location:[touch locationInView:self] pathIndex:(unsigned char)touch.pathIndex inView:self];
+    }
+    [self touchCancelled:cancelled ?: touch executionContext:context];
+
+    // Edit the text once the keyboard has finished this task.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SCPPerform(action);
+    });
+}
+
+- (void)touchCancelled:(UIKBTouchState *)touch executionContext:(UIKeyboardTaskExecutionContext *)context {
+    NSUUID *uuid = [touch touchUUID];
+    if (uuid) [gSpaceTouches removeObject:uuid];
     %orig;
 }
+
 %end
+
+%hook UIKBTree
+
+// Don't let QuickPath (slide-to-type) start on the space key, otherwise the slide is eaten.
+- (BOOL)allowsStartingContinuousPath {
+    return SCPIsSpaceKey(self) ? NO : %orig;
+}
+
 %end
-// }}}
-// ctor {{{
-%ctor
-{
+
+#pragma mark - Constructor
+
+static BOOL SCPShouldLoad(void) {
+    NSString *path = [NSProcessInfo processInfo].arguments.firstObject;
+    if (!path.length) return NO;
+
+    NSString *process = path.lastPathComponent;
+    if ([path containsString:@".appex/"]) return NO;
+    if ([path.lowercaseString containsString:@"fileprovider"]) return NO;
+    NSArray<NSString *> *blacklist = @[ @"AdSheet", @"CoreAuthUI", @"InCallService", @"MessagesNotificationViewService" ];
+    if ([blacklist containsObject:process]) return NO;
+
+    BOOL isSpringBoard = [process isEqualToString:@"SpringBoard"];
+    BOOL isApp = [path containsString:@"/Application/"] || [path containsString:@"/Applications/"];
+    return isSpringBoard || isApp;
+}
+
+%ctor {
     @autoreleasepool {
-        slideCutKeys = [@[@"x", @"c", @"v", @"a", @"z", @"y", @"q", @"p", @"b", @"e", @"s", @"j", @"k", @"h", @"l", @"d", @"delete", @"n", @"m"] retain];
+        if (!SCPShouldLoad()) return;
+
+        SCPKeyMap = @{
+            @"x": @(SCPActionCut),
+            @"c": @(SCPActionCopy),
+            @"v": @(SCPActionPaste),
+            @"a": @(SCPActionSelectAll),
+            @"z": @(SCPActionUndo),
+            @"y": @(SCPActionRedo),
+            @"q": @(SCPActionLineStart),
+            @"p": @(SCPActionLineEnd),
+            @"b": @(SCPActionDocumentStart),
+            @"e": @(SCPActionDocumentEnd),
+            @"s": @(SCPActionSelectWord),
+            @"h": @(SCPActionMoveLeft),
+            @"j": @(SCPActionMoveDown),
+            @"k": @(SCPActionMoveUp),
+            @"l": @(SCPActionMoveRight),
+            @"d": @(SCPActionDefine),
+            @"n": @(SCPActionPreviousWord),
+            @"m": @(SCPActionNextWord),
+            @"delete": @(SCPActionDeleteWord),
+        };
+
+        gSpaceTouches = [NSMutableSet set];
         %init;
-        if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPhone)
-            %init(iPhone);
-        else
-            %init(iPad);
-/*        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, PostNotification, CFSTR("jp.r-plus.slidecut.settingschanged"), NULL, CFNotificationSuspensionBehaviorCoalesce);*/
     }
 }
-// }}}
-/* vim: set fdm=marker : */
